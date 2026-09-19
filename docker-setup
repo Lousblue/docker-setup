@@ -1,0 +1,508 @@
+#!/bin/bash
+#==============================================================================
+# docker-setup - install Docker Engine on Ubuntu or Debian, the official way.
+#
+# Adds Docker's own APT repository after checking its signing key, installs
+# the engine with compose and buildx, caps container logs so they never fill
+# the disk, lets a user run docker without sudo, and runs a test container.
+#
+#   docker-setup                     interactive
+#   docker-setup --status            read only
+#   docker-setup --update            update the engine from Docker's repository
+#   docker-setup --user bob --yes    no questions
+#
+# https://github.com/Lousblue/docker-setup                          MIT licence
+#==============================================================================
+set -Eeuo pipefail
+
+LOG='/var/log/docker-setup.log'
+KEYRING='/etc/apt/keyrings/docker.asc'
+REPO_LIST='/etc/apt/sources.list.d/docker.list'
+DAEMON_JSON='/etc/docker/daemon.json'
+# Docker's release signing key, as published at docs.docker.com. A download
+# that does not match it is refused.
+DOCKER_FPR='9DC858229FC7DD38854AE2D88D81803C0EBFCD88'
+PKGS=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
+DEFAULT_LOG_SIZE='10m'
+DEFAULT_LOG_FILES=3
+
+#--- Output -------------------------------------------------------------------
+if [ -t 1 ]; then
+  TTY=1
+  R=$'\033[0m'; B=$'\033[1m'; D=$'\033[2m'
+  C=$'\033[36m'; G=$'\033[32m'; Y=$'\033[33m'; E=$'\033[31m'
+else
+  TTY=0
+  R=; B=; D=; C=; G=; Y=; E=
+fi
+SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+
+# Blocks: System, Questions, To apply, Done.
+title() { printf '\n%s%s%s\n' "$B" "$1" "$R"; }
+kv()    { printf '  %-13s %s\n' "$1" "$2"; }
+note()  { printf '  %s%s%s\n' "$D" "$1" "$R"; }
+warn()  { printf '  %s!%s %s\n' "$Y" "$R" "$1" >&2; }
+die()   { printf '%serror:%s %s\n' "$E" "$R" "$1" >&2; exit 1; }
+
+# Steps: a framed box per step while applying, with a running log.
+STEP=0; TOTAL=0; WARNINGS=0; CURRENT=''
+log()   { [ -n "${LOG_READY:-}" ] && printf '%s\n' "$1" >>"$LOG"; return 0; }
+step()  { STEP=$((STEP + 1)); CURRENT="$1"
+          printf '\n%s┌─ [%d/%d] %s%s  %s%s%s\n' "$C" "$STEP" "$TOTAL" "$1" "$R" "$D" "$(date +%H:%M:%S)" "$R"
+          log ""; log "=== [$STEP/$TOTAL] $1  $(date '+%F %T')"; }
+info()  { printf '%s│%s  %s\n' "$C" "$R" "$1"; log "    $1"; }
+tick()  { printf '%s│%s  %s✓%s %s\n' "$C" "$R" "$G" "$R" "$1"; }
+flag()  { printf '%s│%s  %s!%s %s\n' "$C" "$R" "$Y" "$R" "$1"; log "    WARNING $1"; WARNINGS=$((WARNINGS + 1)); }
+ok()    { printf '%s└─%s %s✓%s %s\n' "$C" "$R" "$G" "$R" "$1"; log "    OK $1"; }
+stop()  { printf '%s└─%s %s!%s %s\n' "$C" "$R" "$Y" "$R" "$1"; log "    WARNING $1"; WARNINGS=$((WARNINGS + 1)); }
+
+plural()   { if [ "$1" = 1 ]; then echo "1 $2"; else echo "$1 ${3:-${2}s}"; fi; }
+duration() { if [ "$1" -ge 60 ]; then echo "$(($1 / 60)) min $(($1 % 60)) s"; else echo "$1 s"; fi; }
+
+# Runs a command with its output in the log and a spinner on the terminal.
+busy() {   # busy <label> <command...>
+  local label="$1" pid i=0; shift
+  if [ "$TTY" = 0 ]; then "$@" >>"$LOG" 2>&1; return; fi
+  "$@" >>"$LOG" 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    printf '\r\033[K%s│%s  %s%s%s %s' "$C" "$R" "$C" "${SPIN[i]}" "$R" "$label"
+    i=$(( (i + 1) % ${#SPIN[@]} )); sleep 0.1
+  done
+  printf '\r\033[K'
+  wait "$pid"
+}
+
+#--- Help ---------------------------------------------------------------------
+usage() {
+  cat <<EOF
+docker-setup - install Docker Engine on Ubuntu or Debian, the official way.
+
+usage: docker-setup [options]
+
+  Run with no options on a terminal and it asks what to do, showing what it
+  detected. Pass any option and it applies without asking; what you did not
+  mention takes its default.
+
+settings and their defaults
+  --user NAME          who runs docker without sudo      (default: who ran sudo)
+  --no-user            nobody, sudo docker only
+  --log-size SIZE      cap on each container log file    (default: $DEFAULT_LOG_SIZE)
+  --log-files N        log files kept per container      (default: $DEFAULT_LOG_FILES)
+  --no-log-rotation    leave the daemon's logging alone
+  --no-test            skip the hello-world container at the end
+
+other
+  --status             show what is installed, change nothing
+  --update             update the engine from Docker's repository, nothing else
+  --dry-run            show what would be done, then stop
+  --yes, -y            never ask, take every default
+  --help, -h           this text
+
+The repository's signing key is checked against Docker's published
+fingerprint before anything is installed; a mismatch stops the script.
+EOF
+}
+
+#--- Arguments ----------------------------------------------------------------
+MODE='apply'
+ASSUME_YES=0
+DRY_RUN=0
+GIVEN=0
+# The human behind this run: whoever ran sudo, else whoever runs the script.
+ME="${SUDO_USER:-$(id -un)}"
+DOCKER_USER=''; [ "$ME" != root ] && DOCKER_USER="$ME"
+DO_LOGS=yes
+LOG_SIZE="$DEFAULT_LOG_SIZE"
+LOG_FILES="$DEFAULT_LOG_FILES"
+DO_TEST=yes
+
+need_arg() { [ -n "${2:-}" ] || die "$1 needs a value"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --status)          MODE='status' ;;
+    --update)          MODE='update' ;;
+    --help|-h)         usage; exit 0 ;;
+    --yes|-y)          ASSUME_YES=1 ;;
+    --dry-run)         DRY_RUN=1 ;;
+    --user)            need_arg "$@"; DOCKER_USER="$2"; GIVEN=1; shift ;;
+    --no-user)         DOCKER_USER='';  GIVEN=1 ;;
+    --log-size)        need_arg "$@"; LOG_SIZE="$2";  SIZE_GIVEN=1;  GIVEN=1; shift ;;
+    --log-files)       need_arg "$@"; LOG_FILES="$2"; FILES_GIVEN=1; GIVEN=1; shift ;;
+    --no-log-rotation) DO_LOGS=no;      GIVEN=1 ;;
+    --no-test)         DO_TEST=no;      GIVEN=1 ;;
+    *) printf 'unknown option: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# 10m, 500k, 1g: a number then one unit letter.
+valid_size()  { [[ "$1" =~ ^[0-9]+[kmgKMG]$ ]]; }
+valid_count() { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
+valid_size  "$LOG_SIZE"  || die "--log-size wants a number and a unit, like 10m or 1g, got '$LOG_SIZE'"
+valid_count "$LOG_FILES" || die "--log-files wants a whole number above zero, got '$LOG_FILES'"
+
+#--- Privileges ---------------------------------------------------------------
+command -v apt-get >/dev/null || die 'this script is for Debian and Ubuntu (apt-get not found)'
+if [ "$(id -u)" = 0 ]; then
+  SUDO=''
+else
+  command -v sudo >/dev/null || die 'run as root, or install sudo'
+  SUDO='sudo'
+  sudo -v || die 'sudo is required'
+fi
+
+#--- Detection ----------------------------------------------------------------
+# shellcheck disable=SC1091  # the file is the system's, not ours
+os_field() { ( . /etc/os-release 2>/dev/null && eval "printf '%s' \"\${$1:-}\"" ); }
+OS_ID="$(os_field ID)"
+OS_CODENAME="$(os_field VERSION_CODENAME)"
+ARCH="$(dpkg --print-architecture)"
+
+docker_version()  { docker --version 2>/dev/null | sed 's/^Docker version \([^,]*\),.*/\1/' || true; }
+compose_version() { $SUDO docker compose version --short 2>/dev/null || true; }
+service_line() {
+  local a e
+  a="$(systemctl is-active  docker 2>/dev/null || true)"
+  e="$(systemctl is-enabled docker 2>/dev/null || true)"
+  echo "${a:-absent} / ${e:-absent}"
+}
+logs_now() {   # what daemon.json says today
+  [ -r "$DAEMON_JSON" ] || { echo 'none, container logs grow without limit'; return; }
+  local s f
+  s="$(sed -n 's/.*"max-size" *: *"\([^"]*\)".*/\1/p' "$DAEMON_JSON" | head -1)"
+  f="$(sed -n 's/.*"max-file" *: *"\([^"]*\)".*/\1/p' "$DAEMON_JSON" | head -1)"
+  if [ -n "$s" ]; then echo "$s x $(plural "${f:-1}" file) per container"
+  else echo "none in $DAEMON_JSON, container logs grow without limit"; fi
+}
+in_docker_group() { id -nG "$1" 2>/dev/null | tr ' ' '\n' | grep -qx docker; }
+access_line() {
+  if [ "$ME" = root ]; then echo 'root'
+  elif in_docker_group "$ME"; then echo "$ME, without sudo"
+  else echo "$ME, with sudo only"; fi
+}
+containers_line() {
+  local run all
+  run="$($SUDO docker ps -q 2>/dev/null | wc -l | tr -d ' ')"
+  all="$($SUDO docker ps -aq 2>/dev/null | wc -l | tr -d ' ')"
+  echo "$run running, $all in total"
+}
+
+show_system() {
+  local v c
+  title 'System'
+  kv os "$(os_field PRETTY_NAME)  ($ARCH)"
+  v="$(docker_version)"
+  if [ -n "$v" ]; then
+    c="$(compose_version)"
+    kv docker     "$v"
+    kv compose    "${c:-not installed}"
+    kv service    "$(service_line)"
+    kv logs       "$(logs_now)"
+    kv access     "$(access_line)"
+    kv containers "$(containers_line)"
+  else
+    kv docker 'not installed'
+    if [ -f "$REPO_LIST" ]; then kv repository "$REPO_LIST is present"; fi
+  fi
+  return 0
+}
+
+if [ "$MODE" = status ]; then show_system; echo; exit 0; fi
+
+case "$OS_ID" in
+  ubuntu|debian) ;;
+  *) die "Docker publishes packages for Ubuntu and Debian; this is '$OS_ID'" ;;
+esac
+[ -n "$OS_CODENAME" ] || die 'cannot read VERSION_CODENAME from /etc/os-release'
+REPO_URL="https://download.docker.com/linux/$OS_ID"
+
+#--- Apply plumbing -----------------------------------------------------------
+start_log() {
+  $SUDO touch "$LOG"; $SUDO chown "$(id -u)" "$LOG"; $SUDO chmod 600 "$LOG"
+  LOG_READY=1
+  log ""; log "##### docker-setup $(date '+%F %T') $*"
+}
+on_error() {
+  local c=$?
+  [ "$TTY" = 1 ] && printf '\r\033[K'
+  printf '%s└─ ✗ %s failed (exit %d)%s\n' "$E" "$CURRENT" "$c" "$R" >&2
+  printf '   last lines of %s:\n' "$LOG" >&2
+  tail -n 12 "$LOG" 2>/dev/null | sed 's/^/     /' >&2
+  exit "$c"
+}
+arm() {   # error trap and sudo keep-alive, once we start changing things
+  trap on_error ERR
+  KEEP=''
+  if [ -n "$SUDO" ]; then
+    ( while kill -0 $$ 2>/dev/null; do sudo -n true 2>/dev/null || exit; sleep 50; done ) &
+    KEEP=$!
+  fi
+  trap '[ -n "$KEEP" ] && kill "$KEEP" 2>/dev/null; true' EXIT
+}
+# apt with a live view: one tick per package configured, a spinner in between.
+apt_run() {   # apt_run <label> <apt-get arguments...>
+  local label="$1" tmp off=0 i=0 pid slice l p rc=0 cur; shift
+  cur="$label"
+  tmp="$(mktemp)"
+  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -y \
+    -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@" >"$tmp" 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    slice="$(tail -n +$((off + 1)) "$tmp" 2>/dev/null || true)"
+    if [ -n "$slice" ]; then
+      off="$(wc -l <"$tmp")"
+      while IFS= read -r l; do
+        case "$l" in
+          'Setting up '*)         p="${l#Setting up }"; p="${p%% *}"; p="${p%%:*}"
+                                  [ "$TTY" = 1 ] && printf '\r\033[K'; tick "$p"; cur='configuring' ;;
+          'Unpacking '*)          p="${l#Unpacking }"; p="${p%% *}"; cur="unpacking ${p%%:*}" ;;
+          'Get:'*)                cur='downloading' ;;
+          'Processing triggers'*) cur='finishing' ;;
+        esac
+      done <<<"$slice"
+    fi
+    if [ "$TTY" = 1 ]; then
+      printf '\r\033[K%s│%s  %s%s%s %s' "$C" "$R" "$C" "${SPIN[i]}" "$R" "$cur"
+    fi
+    i=$(( (i + 1) % ${#SPIN[@]} )); sleep 0.1
+  done
+  [ "$TTY" = 1 ] && printf '\r\033[K'
+  wait "$pid" || rc=$?
+  cat "$tmp" >>"$LOG"; rm -f "$tmp"
+  return "$rc"
+}
+wait_for_docker() {   # the daemon takes a moment to answer after a restart
+  local _
+  for _ in $(seq 1 30); do $SUDO docker info >/dev/null 2>&1 && return 0; sleep 0.5; done
+  return 1
+}
+finish() {
+  trap - ERR; set +e
+  printf '\n%s' "$C"; printf '─%.0s' $(seq 1 62); printf '%s\n' "$R"
+  printf '%sDone%s in %s, %s\n' "$B" "$R" "$(duration "$SECONDS")" "$(plural "$WARNINGS" warning)"
+  kv docker     "$(docker_version)"
+  kv compose    "$(compose_version)"
+  kv service    "$(service_line)"
+  kv logs       "$(logs_now)"
+  kv access     "$(access_line)"
+  kv log        "$LOG"
+}
+
+#==============================================================================
+# Update
+#==============================================================================
+if [ "$MODE" = update ]; then
+  show_system
+  command -v docker >/dev/null 2>&1 || die 'docker is not installed - run docker-setup without --update first'
+  [ -f "$REPO_LIST" ] || die "$REPO_LIST is missing - run docker-setup without --update first"
+  start_log --update; arm
+  TOTAL=1
+  step 'Docker Engine'
+  BEFORE="$(docker_version)"
+  apt_run 'refreshing package lists' update
+  apt_run 'upgrading' install "${PKGS[@]}"
+  wait_for_docker || true
+  AFTER="$(docker_version)"
+  if [ "$BEFORE" = "$AFTER" ]; then ok "already the latest, $AFTER"
+  else ok "$BEFORE -> $AFTER"; fi
+  finish
+  echo
+  exit 0
+fi
+
+#==============================================================================
+# Plan
+#==============================================================================
+show_system
+INSTALLED="$(docker_version)"
+
+# A cap already in place is the default on a second run, not the built-in one:
+# running the script again must not silently undo what someone chose before.
+if [ -r "$DAEMON_JSON" ]; then
+  CUR_SIZE="$(sed -n 's/.*"max-size" *: *"\([^"]*\)".*/\1/p' "$DAEMON_JSON" | head -1)"
+  CUR_FILES="$(sed -n 's/.*"max-file" *: *"\([^"]*\)".*/\1/p' "$DAEMON_JSON" | head -1)"
+  if valid_size "$CUR_SIZE"; then
+    DEFAULT_LOG_SIZE="$CUR_SIZE"
+    [ "${SIZE_GIVEN:-0}" = 1 ] || LOG_SIZE="$CUR_SIZE"
+  fi
+  if valid_count "$CUR_FILES"; then
+    DEFAULT_LOG_FILES="$CUR_FILES"
+    [ "${FILES_GIVEN:-0}" = 1 ] || LOG_FILES="$CUR_FILES"
+  fi
+fi
+
+#--- Interactive --------------------------------------------------------------
+# Only when nothing was asked for and someone is there to answer. Each question
+# is preceded by one plain line saying what it changes. Answers go into ANS
+# rather than stdout, so a captured prompt never ends up in a value.
+ANS=''
+ask()    { local a; read -r -p "  $1" a || a=''; ANS="${a:-$2}"; }
+ask_yn() { local a d="$2" hint='[Y/n]'; [ "$d" = n ] && hint='[y/N]'
+           read -r -p "  $1 $hint " a || a=''
+           case "${a:-$d}" in [Yy]*) ANS=yes ;; *) ANS=no ;; esac; }
+hint()   { echo; note "$1"; }
+
+if [ "$GIVEN" = 0 ] && [ "$ASSUME_YES" = 0 ] && [ -t 0 ]; then
+  title 'Questions'
+  note 'press enter to accept the value in brackets'
+
+  hint 'Members of the docker group run containers without sudo. That is the same power as root, so only someone you would give root to.'
+  if [ -n "$DOCKER_USER" ]; then
+    ask "User who runs docker without sudo [$DOCKER_USER] (- for none): " "$DOCKER_USER"
+    [ "$ANS" = '-' ] && ANS=''
+  else
+    ask 'User who runs docker without sudo (empty = none): ' ''
+  fi
+  DOCKER_USER="$ANS"
+
+  hint 'Without a cap, one chatty container fills the disk in a few weeks and nothing warns you. Each container keeps a few files of a fixed size.'
+  ask_yn 'Cap container logs?' y; DO_LOGS="$ANS"
+  if [ "$DO_LOGS" = yes ]; then
+    while :; do
+      ask "  Size of each log file [$DEFAULT_LOG_SIZE]: " "$DEFAULT_LOG_SIZE"
+      if valid_size "$ANS"; then LOG_SIZE="$ANS"; break; fi
+      warn 'a number and a unit, like 10m, 500k or 1g'
+    done
+    while :; do
+      ask "  Files kept per container [$DEFAULT_LOG_FILES]: " "$DEFAULT_LOG_FILES"
+      if valid_count "$ANS"; then LOG_FILES="$ANS"; break; fi
+      warn 'a whole number above zero'
+    done
+  fi
+
+  hint 'Pulls a tiny image, runs it once and removes it, to prove the engine works from end to end.'
+  ask_yn 'Run a test container at the end?' y; DO_TEST="$ANS"
+fi
+
+if [ -n "$DOCKER_USER" ] && ! id "$DOCKER_USER" >/dev/null 2>&1; then
+  warn "user $DOCKER_USER does not exist - nobody is added to the docker group"
+  DOCKER_USER=''
+fi
+
+#--- To apply -----------------------------------------------------------------
+title 'To apply'
+kv repository "Docker's own, for $OS_ID $OS_CODENAME, signing key checked"
+if [ -n "$INSTALLED" ]; then kv engine "$INSTALLED already here, upgraded if Docker has a newer one"
+else kv engine 'docker-ce with the cli, containerd, buildx and compose'; fi
+TOTAL=4
+[ "$DO_LOGS" = yes ]   && { kv logs "$LOG_SIZE x $(plural "$LOG_FILES" file) per container"; TOTAL=$((TOTAL + 1)); }
+[ -n "$DOCKER_USER" ]  && { kv user "$DOCKER_USER runs docker without sudo"; TOTAL=$((TOTAL + 1)); }
+[ "$DO_TEST" = yes ]   && { kv test 'hello-world container, then removed'; TOTAL=$((TOTAL + 1)); }
+
+if [ "$DRY_RUN" = 1 ]; then echo; exit 0; fi
+if [ "$GIVEN" = 0 ] && [ "$ASSUME_YES" = 0 ] && [ -t 0 ]; then
+  echo; ask_yn "Apply these $TOTAL steps?" y
+  [ "$ANS" = yes ] || { note 'nothing changed'; echo; exit 0; }
+fi
+
+#==============================================================================
+# Apply
+#==============================================================================
+start_log; arm
+
+#--- prerequisites ------------------------------------------------------------
+step 'Prerequisites'
+apt_run 'refreshing package lists' update
+apt_run 'installing ca-certificates, curl, gnupg' install ca-certificates curl gnupg
+ok 'ready'
+
+#--- signing key --------------------------------------------------------------
+step 'Signing key'
+TMPKEY="$(mktemp)"
+busy "downloading $REPO_URL/gpg" curl -fsSL "$REPO_URL/gpg" -o "$TMPKEY"
+FPR="$(gpg --show-keys --with-colons "$TMPKEY" 2>/dev/null | awk -F: '/^fpr:/ { print $10; exit }')"
+info "fingerprint ${FPR:-unreadable}"
+if [ "$FPR" != "$DOCKER_FPR" ]; then
+  rm -f "$TMPKEY"
+  printf '%s└─ ✗ this is not the key Docker publishes (expected %s) - stopping, nothing installed%s\n' "$E" "$DOCKER_FPR" "$R" >&2
+  exit 1
+fi
+$SUDO install -m 0755 -d /etc/apt/keyrings
+$SUDO install -m 0644 "$TMPKEY" "$KEYRING"; rm -f "$TMPKEY"
+info "$KEYRING"
+ok "matches Docker's published fingerprint"
+
+#--- repository ---------------------------------------------------------------
+step 'Repository'
+echo "deb [arch=$ARCH signed-by=$KEYRING] $REPO_URL $OS_CODENAME stable" | $SUDO tee "$REPO_LIST" >/dev/null
+info "$REPO_LIST"
+info "$REPO_URL $OS_CODENAME stable, $ARCH"
+apt_run 'refreshing package lists' update
+ok 'declared'
+
+#--- engine -------------------------------------------------------------------
+step 'Docker Engine'
+apt_run 'installing' install "${PKGS[@]}"
+busy 'starting the service' $SUDO systemctl enable --now docker
+wait_for_docker || flag 'the daemon does not answer yet - systemctl status docker'
+ok "$(docker_version), compose $(compose_version)"
+
+#--- log rotation -------------------------------------------------------------
+if [ "$DO_LOGS" = yes ]; then
+  step 'Log rotation'
+  $SUDO install -m 0755 -d /etc/docker
+  if [ -s "$DAEMON_JSON" ] && ! grep -q '"log-opts"' "$DAEMON_JSON"; then
+    BACKUP="$DAEMON_JSON.$(date +%Y%m%d-%H%M%S).bak"
+    $SUDO cp "$DAEMON_JSON" "$BACKUP"
+    flag "an existing $DAEMON_JSON was replaced - your copy is $BACKUP, merge it back by hand"
+  fi
+  $SUDO tee "$DAEMON_JSON" >/dev/null <<EOF
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "$LOG_SIZE",
+    "max-file": "$LOG_FILES"
+  }
+}
+EOF
+  info "$DAEMON_JSON"
+  busy 'restarting the service' $SUDO systemctl restart docker
+  if wait_for_docker; then ok "$LOG_SIZE x $(plural "$LOG_FILES" file) per container, applies to containers created from now on"
+  else stop "written, but the daemon did not come back - journalctl -u docker"; fi
+fi
+
+#--- user ---------------------------------------------------------------------
+if [ -n "$DOCKER_USER" ]; then
+  step 'User access'
+  if in_docker_group "$DOCKER_USER"; then
+    ok "$DOCKER_USER is already in the docker group"
+  else
+    $SUDO usermod -aG docker "$DOCKER_USER"
+    info "$DOCKER_USER added to the docker group"
+    ok 'applies to new sessions: log out and back in, or run: newgrp docker'
+  fi
+fi
+
+#--- test ---------------------------------------------------------------------
+if [ "$DO_TEST" = yes ]; then
+  step 'Test'
+  if busy 'pulling and running hello-world' $SUDO docker run --rm hello-world; then
+    $SUDO docker rmi hello-world >>"$LOG" 2>&1 || true
+    ok 'a container ran and was removed, the engine works'
+  else
+    stop "hello-world did not run - details in $LOG"
+  fi
+fi
+
+#==============================================================================
+# Done
+#==============================================================================
+finish
+if [ -n "$DOCKER_USER" ] && [ "$DOCKER_USER" = "$ME" ] && ! id -nG 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+  echo
+  warn 'log out and back in before using docker without sudo'
+  # Offer to do it, but only to someone who is there to answer. The session
+  # leader is the login shell, whether this ran directly or through sudo.
+  if [ "$GIVEN" = 0 ] && [ "$ASSUME_YES" = 0 ] && [ -t 0 ]; then
+    hint 'The docker group applies to new sessions only. This closes the current SSH session; reconnect and docker works without sudo.'
+    ask_yn 'Log out now?' y
+    if [ "$ANS" = yes ]; then
+      printf '  logging out\n\n'
+      kill -HUP "$(ps -o sid= -p $$ | tr -d ' ')" 2>/dev/null || kill -HUP "$PPID"
+      exit 0
+    fi
+  fi
+fi
+echo
